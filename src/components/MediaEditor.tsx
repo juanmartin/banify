@@ -1,8 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, Download, RotateCcw, Eye, EyeOff, Trash2, Sparkles, Undo2, Wand2, Scissors, AlertCircle } from 'lucide-react';
+import { Upload, Download, RotateCcw, Eye, EyeOff, Trash2, Sparkles, Undo2, Wand2, Scissors, AlertCircle, Brain, Target, Zap } from 'lucide-react';
 import { useAIProcessing } from '../hooks/useAIProcessing';
 import ProcessingModal from './ProcessingModal';
-import { Point, Selection } from '../types/ai-processing';
+import { Point, Selection, DetectedObject } from '../types/ai-processing';
 
 const MediaEditor: React.FC = () => {
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
@@ -12,19 +12,27 @@ const MediaEditor: React.FC = () => {
   const [showOriginal, setShowOriginal] = useState(false);
   const [draggedPointIndex, setDraggedPointIndex] = useState<number | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [smartSelectionMode, setSmartSelectionMode] = useState(false);
+  const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const originalCanvasRef = useRef<HTMLCanvasElement>(null);
 
   const {
     isProcessing,
+    isDetecting,
     progress,
     error: processingError,
     result,
+    detectedObjects,
+    detectObjects,
     processSmartRemoval,
     cancelProcessing,
     clearError,
-    memoryUsage
+    clearDetectedObjects,
+    selectObject,
+    memoryUsage,
+    availableModels
   } = useAIProcessing();
 
   const filters = [
@@ -32,7 +40,7 @@ const MediaEditor: React.FC = () => {
     { id: 'blur', name: 'Black Mirror Blur', icon: Sparkles },
     { id: 'noise', name: 'Digital Noise', icon: Sparkles },
     { id: 'desaturate', name: 'Dystopian', icon: Sparkles },
-    { id: 'smart_remove', name: 'AI Smart Remove', icon: Wand2, isAI: true },
+    { id: 'smart_remove', name: 'AI Smart Remove', icon: Brain, isAI: true },
     { id: 'cutout', name: 'Precise Cutout', icon: Scissors },
     { id: 'remove', name: 'Simple Remove', icon: Trash2 },
   ];
@@ -45,7 +53,6 @@ const MediaEditor: React.FC = () => {
     }
   }, [uploadedFile]);
 
-  // Handle AI processing result
   useEffect(() => {
     if (result && result.success && result.canvas && canvasRef.current) {
       const ctx = canvasRef.current.getContext('2d');
@@ -62,7 +69,10 @@ const MediaEditor: React.FC = () => {
       setUploadedFile(file);
       setSelection({ points: [], isComplete: false });
       setActiveFilter('none');
+      setSmartSelectionMode(false);
+      setSelectedObjectId(null);
       clearError();
+      clearDetectedObjects();
     }
   };
 
@@ -73,12 +83,15 @@ const MediaEditor: React.FC = () => {
       setUploadedFile(file);
       setSelection({ points: [], isComplete: false });
       setActiveFilter('none');
+      setSmartSelectionMode(false);
+      setSelectedObjectId(null);
       clearError();
+      clearDetectedObjects();
     }
   };
 
-  const handleCanvasClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!canvasRef.current || !imageRef.current || isDragging || isProcessing) return;
+  const handleCanvasClick = async (event: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!canvasRef.current || !imageRef.current || isDragging || isProcessing || isDetecting) return;
 
     const canvas = canvasRef.current;
     const rect = canvas.getBoundingClientRect();
@@ -92,24 +105,66 @@ const MediaEditor: React.FC = () => {
     const actualX = clickX * scaleX;
     const actualY = clickY * scaleY;
 
-    const newPoint = { x: actualX, y: actualY };
-    const newPoints = [...selection.points, newPoint];
+    const clickPoint = { x: actualX, y: actualY };
 
-    setSelection({
-      points: newPoints,
-      isComplete: newPoints.length >= 3
-    });
+    if (smartSelectionMode) {
+      // Smart object detection mode
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        await detectObjects(imageData, clickPoint);
+      }
+    } else {
+      // Manual point selection mode
+      const newPoint = clickPoint;
+      const newPoints = [...selection.points, newPoint];
+
+      setSelection({
+        points: newPoints,
+        isComplete: newPoints.length >= 3
+      });
+    }
+  };
+
+  const handleObjectSelect = (objectId: string) => {
+    setSelectedObjectId(objectId);
+    const selectedObj = selectObject(objectId);
+    if (selectedObj) {
+      // Convert bounding box to selection points
+      const bbox = selectedObj.bbox;
+      const points: Point[] = [
+        { x: bbox.x, y: bbox.y },
+        { x: bbox.x + bbox.width, y: bbox.y },
+        { x: bbox.x + bbox.width, y: bbox.y + bbox.height },
+        { x: bbox.x, y: bbox.y + bbox.height }
+      ];
+      
+      setSelection({
+        points,
+        isComplete: true,
+        selectedObjectId: objectId
+      });
+    }
+  };
+
+  const toggleSmartSelection = () => {
+    setSmartSelectionMode(!smartSelectionMode);
+    if (!smartSelectionMode) {
+      clearDetectedObjects();
+      setSelectedObjectId(null);
+      setSelection({ points: [], isComplete: false });
+    }
   };
 
   const handlePointMouseDown = (event: React.MouseEvent, pointIndex: number) => {
-    if (isProcessing) return;
+    if (isProcessing || isDetecting || smartSelectionMode) return;
     event.stopPropagation();
     setDraggedPointIndex(pointIndex);
     setIsDragging(true);
   };
 
   const handlePointDoubleClick = (event: React.MouseEvent, pointIndex: number) => {
-    if (isProcessing) return;
+    if (isProcessing || isDetecting || smartSelectionMode) return;
     event.stopPropagation();
     
     const newPoints = selection.points.filter((_, index) => index !== pointIndex);
@@ -121,7 +176,7 @@ const MediaEditor: React.FC = () => {
   };
 
   const handleMouseMove = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (draggedPointIndex === null || !canvasRef.current || !isDragging || isProcessing) return;
+    if (draggedPointIndex === null || !canvasRef.current || !isDragging || isProcessing || isDetecting || smartSelectionMode) return;
 
     const canvas = canvasRef.current;
     const rect = canvas.getBoundingClientRect();
@@ -150,7 +205,7 @@ const MediaEditor: React.FC = () => {
   };
 
   const undoLastPoint = () => {
-    if (selection.points.length === 0 || isProcessing) return;
+    if (selection.points.length === 0 || isProcessing || isDetecting || smartSelectionMode) return;
     
     const newPoints = selection.points.slice(0, -1);
     setSelection({
@@ -160,12 +215,15 @@ const MediaEditor: React.FC = () => {
   };
 
   const clearSelection = () => {
-    if (isProcessing) return;
+    if (isProcessing || isDetecting) return;
     setSelection({ points: [], isComplete: false });
+    setSelectedObjectId(null);
+    clearDetectedObjects();
+    setSmartSelectionMode(false);
   };
 
   const applyFilter = async (filterId: string) => {
-    if (!canvasRef.current || !imageRef.current || isProcessing) return;
+    if (!canvasRef.current || !imageRef.current || isProcessing || isDetecting) return;
 
     setActiveFilter(filterId);
     clearError();
@@ -174,7 +232,6 @@ const MediaEditor: React.FC = () => {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Store original image data
     if (!originalCanvasRef.current) {
       originalCanvasRef.current = document.createElement('canvas');
       originalCanvasRef.current.width = canvas.width;
@@ -183,21 +240,19 @@ const MediaEditor: React.FC = () => {
       originalCtx.drawImage(imageRef.current, 0, 0, canvas.width, canvas.height);
     }
 
-    // Draw original image
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(imageRef.current, 0, 0, canvas.width, canvas.height);
 
     if (selection.isComplete && filterId !== 'none') {
       if (filterId === 'smart_remove') {
-        // Use AI processing service
         try {
           const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-          await processSmartRemoval(imageData, selection.points);
+          const selectedObj = selectedObjectId ? selectObject(selectedObjectId) : undefined;
+          await processSmartRemoval(imageData, selection.points, selectedObj);
         } catch (error) {
           console.error('Smart removal failed:', error);
         }
       } else {
-        // Apply other filters with error handling
         try {
           await applyStandardFilter(ctx, filterId);
         } catch (error) {
@@ -234,7 +289,6 @@ const MediaEditor: React.FC = () => {
               ctx.filter = 'contrast(1.5) brightness(0.8) saturate(0.5)';
               ctx.drawImage(imageRef.current!, 0, 0, ctx.canvas.width, ctx.canvas.height);
               
-              // Add digital noise effect
               const imageData = ctx.getImageData(0, 0, ctx.canvas.width, ctx.canvas.height);
               const data = imageData.data;
               for (let i = 0; i < data.length; i += 4) {
@@ -312,9 +366,6 @@ const MediaEditor: React.FC = () => {
 
   const updateCanvasScale = () => {
     if (!canvasRef.current || !imageRef.current) return;
-    
-    const canvas = canvasRef.current;
-    const rect = canvas.getBoundingClientRect();
   };
 
   useEffect(() => {
@@ -325,26 +376,23 @@ const MediaEditor: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-black to-gray-900 text-white">
-      {/* Processing Modal */}
       <ProcessingModal
-        isOpen={isProcessing}
+        isOpen={isProcessing || isDetecting}
         progress={progress}
         onCancel={cancelProcessing}
         memoryUsage={memoryUsage}
       />
 
-      {/* Header */}
       <div className="bg-black/50 backdrop-blur-lg border-b border-cyan-500/20">
         <div className="max-w-7xl mx-auto px-4 py-4">
           <h1 className="text-2xl font-bold bg-gradient-to-r from-cyan-400 to-purple-400 bg-clip-text text-transparent">
             Black Mirror Editor
           </h1>
-          <p className="text-gray-400 text-sm mt-1">Advanced AI-powered media manipulation with intelligent algorithms</p>
+          <p className="text-gray-400 text-sm mt-1">Advanced AI-powered media manipulation with Hugging Face integration</p>
         </div>
       </div>
 
       <div className="max-w-7xl mx-auto px-4 py-8">
-        {/* Error Display */}
         {processingError && (
           <div className="mb-6 p-4 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-3">
             <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
@@ -362,7 +410,6 @@ const MediaEditor: React.FC = () => {
         )}
 
         {!uploadedFile ? (
-          // Upload Area
           <div
             className="border-2 border-dashed border-cyan-500/30 rounded-2xl p-12 text-center hover:border-cyan-400/50 transition-colors duration-300 bg-gradient-to-br from-gray-800/30 to-gray-900/30 backdrop-blur-sm"
             onDrop={handleDrop}
@@ -383,17 +430,27 @@ const MediaEditor: React.FC = () => {
             </label>
           </div>
         ) : (
-          // Editor Interface
           <div className="grid lg:grid-cols-3 gap-8">
-            {/* Canvas Area */}
             <div className="lg:col-span-2">
               <div className="bg-gray-800/50 rounded-2xl p-6 backdrop-blur-sm border border-gray-700/50">
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-lg font-semibold text-white">AI-Powered Editor Canvas</h3>
                   <div className="flex items-center gap-2">
                     <button
+                      onClick={toggleSmartSelection}
+                      disabled={isProcessing || isDetecting}
+                      className={`p-2 rounded-lg transition-all duration-300 disabled:opacity-50 ${
+                        smartSelectionMode 
+                          ? 'bg-gradient-to-r from-purple-500 to-pink-500 text-white' 
+                          : 'bg-gray-700/50 hover:bg-gray-600/50'
+                      }`}
+                      title={smartSelectionMode ? "Disable Smart Selection" : "Enable Smart Selection"}
+                    >
+                      <Brain className="w-4 h-4" />
+                    </button>
+                    <button
                       onClick={() => setShowOriginal(!showOriginal)}
-                      disabled={isProcessing}
+                      disabled={isProcessing || isDetecting}
                       className="p-2 rounded-lg bg-gray-700/50 hover:bg-gray-600/50 transition-colors disabled:opacity-50"
                       title={showOriginal ? "Hide Original" : "Show Original"}
                     >
@@ -401,7 +458,7 @@ const MediaEditor: React.FC = () => {
                     </button>
                     <button
                       onClick={undoLastPoint}
-                      disabled={selection.points.length === 0 || isProcessing}
+                      disabled={selection.points.length === 0 || isProcessing || isDetecting || smartSelectionMode}
                       className="p-2 rounded-lg bg-gray-700/50 hover:bg-gray-600/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                       title="Undo Last Point"
                     >
@@ -409,15 +466,15 @@ const MediaEditor: React.FC = () => {
                     </button>
                     <button
                       onClick={clearSelection}
-                      disabled={isProcessing}
+                      disabled={isProcessing || isDetecting}
                       className="p-2 rounded-lg bg-gray-700/50 hover:bg-gray-600/50 transition-colors disabled:opacity-50"
-                      title="Clear All Points"
+                      title="Clear Selection"
                     >
                       <RotateCcw className="w-4 h-4" />
                     </button>
                     <button
                       onClick={downloadImage}
-                      disabled={isProcessing}
+                      disabled={isProcessing || isDetecting}
                       className="p-2 rounded-lg bg-gradient-to-r from-cyan-500 to-purple-500 hover:from-cyan-400 hover:to-purple-400 transition-all duration-300 disabled:opacity-50"
                       title="Download Edited Image"
                     >
@@ -427,7 +484,9 @@ const MediaEditor: React.FC = () => {
                 </div>
 
                 <div 
-                  className={`relative bg-black rounded-lg overflow-hidden ${isProcessing ? 'pointer-events-none' : ''}`}
+                  className={`relative bg-black rounded-lg overflow-hidden ${
+                    isProcessing || isDetecting ? 'pointer-events-none' : ''
+                  }`}
                   onMouseMove={handleMouseMove}
                   onMouseUp={handleMouseUp}
                   onMouseLeave={handleMouseUp}
@@ -450,11 +509,57 @@ const MediaEditor: React.FC = () => {
                   <canvas
                     ref={canvasRef}
                     onClick={handleCanvasClick}
-                    className={`w-full h-auto ${isProcessing ? 'cursor-wait' : 'cursor-crosshair'} ${showOriginal ? 'hidden' : 'block'} ${isDragging ? 'cursor-grabbing' : ''}`}
+                    className={`w-full h-auto ${
+                      isProcessing || isDetecting ? 'cursor-wait' : 
+                      smartSelectionMode ? 'cursor-crosshair' : 'cursor-crosshair'
+                    } ${showOriginal ? 'hidden' : 'block'} ${isDragging ? 'cursor-grabbing' : ''}`}
                   />
 
-                  {/* Selection Points */}
-                  {selection.points.map((point, index) => {
+                  {/* Detected Objects Overlay */}
+                  {detectedObjects.map((obj) => {
+                    if (!canvasRef.current) return null;
+                    const rect = canvasRef.current.getBoundingClientRect();
+                    const scaleX = rect.width / canvasRef.current.width;
+                    const scaleY = rect.height / canvasRef.current.height;
+                    
+                    const displayX = obj.bbox.x * scaleX;
+                    const displayY = obj.bbox.y * scaleY;
+                    const displayWidth = obj.bbox.width * scaleX;
+                    const displayHeight = obj.bbox.height * scaleY;
+                    
+                    return (
+                      <div
+                        key={obj.id}
+                        className={`absolute border-2 rounded-lg cursor-pointer transition-all duration-200 ${
+                          selectedObjectId === obj.id 
+                            ? 'border-purple-400 bg-purple-400/20' 
+                            : 'border-cyan-400 bg-cyan-400/10 hover:bg-cyan-400/20'
+                        }`}
+                        style={{
+                          left: `${displayX}px`,
+                          top: `${displayY}px`,
+                          width: `${displayWidth}px`,
+                          height: `${displayHeight}px`,
+                          borderColor: obj.color,
+                          zIndex: 5
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleObjectSelect(obj.id);
+                        }}
+                      >
+                        <div 
+                          className="absolute -top-6 left-0 px-2 py-1 rounded text-xs font-medium text-white"
+                          style={{ backgroundColor: obj.color }}
+                        >
+                          {obj.label} ({Math.round(obj.confidence * 100)}%)
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  {/* Manual Selection Points */}
+                  {!smartSelectionMode && selection.points.map((point, index) => {
                     if (!canvasRef.current) return null;
                     const rect = canvasRef.current.getBoundingClientRect();
                     const displayX = (point.x / canvasRef.current.width) * rect.width;
@@ -464,7 +569,7 @@ const MediaEditor: React.FC = () => {
                       <div
                         key={index}
                         className={`absolute w-4 h-4 bg-cyan-400 rounded-full border-2 border-white transform -translate-x-2 -translate-y-2 ${
-                          isProcessing ? 'cursor-wait' : 'cursor-grab hover:bg-cyan-300 hover:scale-110'
+                          isProcessing || isDetecting ? 'cursor-wait' : 'cursor-grab hover:bg-cyan-300 hover:scale-110'
                         } transition-all duration-200 ${
                           draggedPointIndex === index ? 'animate-pulse scale-125 cursor-grabbing' : 'animate-pulse'
                         }`}
@@ -481,7 +586,7 @@ const MediaEditor: React.FC = () => {
                   })}
 
                   {/* Selection Lines */}
-                  {selection.points.length > 1 && (
+                  {!smartSelectionMode && selection.points.length > 1 && (
                     <svg
                       className="absolute inset-0 w-full h-full pointer-events-none"
                       style={{ zIndex: 1 }}
@@ -508,7 +613,6 @@ const MediaEditor: React.FC = () => {
                           />
                         );
                       })}
-                      {/* Close the polygon if complete */}
                       {selection.isComplete && selection.points.length > 2 && canvasRef.current && (
                         <line
                           x1={(selection.points[selection.points.length - 1].x / canvasRef.current.width) * canvasRef.current.getBoundingClientRect().width}
@@ -524,24 +628,112 @@ const MediaEditor: React.FC = () => {
                   )}
                 </div>
 
-                {selection.points.length > 0 && (
-                  <div className="text-sm text-gray-400 mt-3 space-y-1">
-                    <p>
-                      {selection.points.length < 3 
-                        ? `Click ${3 - selection.points.length} more points to complete selection`
-                        : "Selection complete! Choose an AI filter to apply advanced processing."
-                      }
-                    </p>
-                    <p className="text-xs text-gray-500">
-                      💡 <strong>Controls:</strong> Click = Add point • Drag = Move point • Double-click = Remove point • Undo = Remove last point
-                    </p>
-                  </div>
-                )}
+                {/* Selection Status */}
+                <div className="text-sm text-gray-400 mt-3 space-y-1">
+                  {smartSelectionMode ? (
+                    <div className="space-y-1">
+                      <p className="flex items-center gap-2">
+                        <Brain className="w-4 h-4 text-purple-400" />
+                        <strong className="text-purple-400">Smart Selection Mode:</strong> 
+                        Click on objects to detect and select them automatically
+                      </p>
+                      {detectedObjects.length > 0 && (
+                        <p className="text-green-400">
+                          ✓ Detected {detectedObjects.length} object{detectedObjects.length !== 1 ? 's' : ''}. 
+                          Click on highlighted objects to select them.
+                        </p>
+                      )}
+                    </div>
+                  ) : (
+                    <div>
+                      <p>
+                        {selection.points.length < 3 
+                          ? `Click ${3 - selection.points.length} more points to complete selection`
+                          : "Selection complete! Choose an AI filter to apply advanced processing."
+                        }
+                      </p>
+                      <p className="text-xs text-gray-500">
+                        💡 <strong>Manual Mode:</strong> Click = Add point • Drag = Move point • Double-click = Remove point
+                      </p>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 
-            {/* Controls Panel */}
             <div className="space-y-6">
+              {/* Selection Mode Toggle */}
+              <div className="bg-gray-800/50 rounded-2xl p-6 backdrop-blur-sm border border-gray-700/50">
+                <h3 className="text-lg font-semibold mb-4 text-white">Selection Mode</h3>
+                <div className="space-y-3">
+                  <button
+                    onClick={() => setSmartSelectionMode(false)}
+                    disabled={isProcessing || isDetecting}
+                    className={`w-full flex items-center gap-3 p-3 rounded-lg transition-all duration-300 ${
+                      !smartSelectionMode
+                        ? 'bg-gradient-to-r from-cyan-500/20 to-blue-500/20 border border-cyan-400/50'
+                        : 'bg-gray-700/30 hover:bg-gray-600/40 border border-transparent'
+                    } ${isProcessing || isDetecting ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                  >
+                    <Target className="w-5 h-5 text-cyan-400" />
+                    <div className="text-left flex-1">
+                      <span className="text-white block">Manual Selection</span>
+                      <span className="text-xs text-cyan-300">Point-by-point selection</span>
+                    </div>
+                  </button>
+                  
+                  <button
+                    onClick={() => setSmartSelectionMode(true)}
+                    disabled={isProcessing || isDetecting}
+                    className={`w-full flex items-center gap-3 p-3 rounded-lg transition-all duration-300 ${
+                      smartSelectionMode
+                        ? 'bg-gradient-to-r from-purple-500/20 to-pink-500/20 border border-purple-400/50'
+                        : 'bg-gray-700/30 hover:bg-gray-600/40 border border-transparent'
+                    } ${isProcessing || isDetecting ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                  >
+                    <Brain className="w-5 h-5 text-purple-400" />
+                    <div className="text-left flex-1">
+                      <span className="text-white block">Smart Selection</span>
+                      <span className="text-xs text-purple-300">AI-powered object detection</span>
+                    </div>
+                  </button>
+                </div>
+              </div>
+
+              {/* Detected Objects Panel */}
+              {detectedObjects.length > 0 && (
+                <div className="bg-gray-800/50 rounded-2xl p-6 backdrop-blur-sm border border-gray-700/50">
+                  <h3 className="text-lg font-semibold mb-4 text-white">Detected Objects</h3>
+                  <div className="space-y-2 max-h-48 overflow-y-auto">
+                    {detectedObjects.map((obj) => (
+                      <button
+                        key={obj.id}
+                        onClick={() => handleObjectSelect(obj.id)}
+                        className={`w-full flex items-center gap-3 p-3 rounded-lg transition-all duration-300 text-left ${
+                          selectedObjectId === obj.id
+                            ? 'bg-purple-500/20 border border-purple-400/50'
+                            : 'bg-gray-700/30 hover:bg-gray-600/40 border border-transparent'
+                        }`}
+                      >
+                        <div 
+                          className="w-4 h-4 rounded-full flex-shrink-0"
+                          style={{ backgroundColor: obj.color }}
+                        />
+                        <div className="flex-1">
+                          <span className="text-white block font-medium">{obj.label}</span>
+                          <span className="text-xs text-gray-400">
+                            Confidence: {Math.round(obj.confidence * 100)}%
+                          </span>
+                        </div>
+                        {selectedObjectId === obj.id && (
+                          <Zap className="w-4 h-4 text-purple-400" />
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Filter Selection */}
               <div className="bg-gray-800/50 rounded-2xl p-6 backdrop-blur-sm border border-gray-700/50">
                 <h3 className="text-lg font-semibold mb-4 text-white">AI Filters & Tools</h3>
@@ -555,13 +747,13 @@ const MediaEditor: React.FC = () => {
                       <button
                         key={filter.id}
                         onClick={() => applyFilter(filter.id)}
-                        disabled={isDisabled || isProcessing}
+                        disabled={isDisabled || isProcessing || isDetecting}
                         className={`w-full flex items-center gap-3 p-3 rounded-lg transition-all duration-300 ${
                           activeFilter === filter.id
                             ? 'bg-gradient-to-r from-cyan-500/20 to-purple-500/20 border border-cyan-400/50'
                             : 'bg-gray-700/30 hover:bg-gray-600/40 border border-transparent'
                         } ${
-                          isDisabled || isProcessing
+                          isDisabled || isProcessing || isDetecting
                             ? 'opacity-50 cursor-not-allowed'
                             : 'cursor-pointer'
                         }`}
@@ -570,7 +762,7 @@ const MediaEditor: React.FC = () => {
                         <div className="text-left flex-1">
                           <span className="text-white block">{filter.name}</span>
                           {isAdvanced && (
-                            <span className="text-xs text-purple-300">Advanced AI</span>
+                            <span className="text-xs text-purple-300">Hugging Face AI</span>
                           )}
                         </div>
                       </button>
@@ -590,13 +782,13 @@ const MediaEditor: React.FC = () => {
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-gray-400">AI Services:</span>
-                    <span className="text-yellow-400">Fallback Mode</span>
+                    <span className="text-gray-400">Hugging Face Models:</span>
+                    <span className="text-purple-400">{availableModels.huggingface.length} Available</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-gray-400">Processing:</span>
-                    <span className={isProcessing ? 'text-blue-400' : 'text-green-400'}>
-                      {isProcessing ? 'Active' : 'Ready'}
+                    <span className={isProcessing || isDetecting ? 'text-blue-400' : 'text-green-400'}>
+                      {isProcessing || isDetecting ? 'Active' : 'Ready'}
                     </span>
                   </div>
                 </div>
@@ -607,26 +799,26 @@ const MediaEditor: React.FC = () => {
                 <h3 className="text-lg font-semibold mb-4 text-white">How to Use</h3>
                 <div className="space-y-3 text-sm text-gray-300">
                   <div className="flex items-start gap-3">
-                    <div className="w-6 h-6 bg-cyan-500 rounded-full flex items-center justify-center text-xs font-bold text-black flex-shrink-0">1</div>
-                    <p><strong>Click</strong> on the image to add selection points (minimum 3 points needed)</p>
+                    <div className="w-6 h-6 bg-purple-500 rounded-full flex items-center justify-center text-xs font-bold text-white flex-shrink-0">1</div>
+                    <p><strong>Choose Selection Mode:</strong> Smart Selection for AI detection or Manual for precise control</p>
                   </div>
                   <div className="flex items-start gap-3">
-                    <div className="w-6 h-6 bg-cyan-500 rounded-full flex items-center justify-center text-xs font-bold text-black flex-shrink-0">2</div>
-                    <p><strong>Drag</strong> any point to move it to a better position</p>
+                    <div className="w-6 h-6 bg-purple-500 rounded-full flex items-center justify-center text-xs font-bold text-white flex-shrink-0">2</div>
+                    <p><strong>Smart Mode:</strong> Click on objects to detect them automatically</p>
                   </div>
                   <div className="flex items-start gap-3">
-                    <div className="w-6 h-6 bg-cyan-500 rounded-full flex items-center justify-center text-xs font-bold text-black flex-shrink-0">3</div>
-                    <p><strong>Double-click</strong> any point to remove it</p>
+                    <div className="w-6 h-6 bg-purple-500 rounded-full flex items-center justify-center text-xs font-bold text-white flex-shrink-0">3</div>
+                    <p><strong>Manual Mode:</strong> Click to add points, drag to move, double-click to remove</p>
                   </div>
                   <div className="flex items-start gap-3">
-                    <div className="w-6 h-6 bg-cyan-500 rounded-full flex items-center justify-center text-xs font-bold text-black flex-shrink-0">4</div>
-                    <p>Choose an AI filter and wait for processing</p>
+                    <div className="w-6 h-6 bg-purple-500 rounded-full flex items-center justify-center text-xs font-bold text-white flex-shrink-0">4</div>
+                    <p>Apply AI filters powered by Hugging Face models</p>
                   </div>
                 </div>
                 
                 <div className="mt-4 p-3 bg-purple-500/10 rounded-lg border border-purple-500/20">
                   <p className="text-xs text-purple-300">
-                    <strong>AI Smart Remove:</strong> Uses advanced algorithms with fallback to local processing if AI services are unavailable.
+                    <strong>Hugging Face Integration:</strong> Uses SegFormer, DETR, Mask2Former, and SAM models for state-of-the-art object detection and segmentation.
                   </p>
                 </div>
               </div>

@@ -12,6 +12,7 @@ export interface AIModelConfig {
   timeout: number;
   maxRetries: number;
   supportedFormats: string[];
+  type: 'segmentation' | 'background_removal' | 'object_detection';
 }
 
 export interface ProcessingResult {
@@ -20,6 +21,7 @@ export interface ProcessingResult {
   canvas?: HTMLCanvasElement;
   error?: string;
   processingTime: number;
+  detectedObjects?: DetectedObject[];
 }
 
 export interface AIServiceResponse {
@@ -27,11 +29,12 @@ export interface AIServiceResponse {
   data?: ArrayBuffer | Blob;
   error?: string;
   processingId?: string;
+  detectedObjects?: DetectedObject[];
 }
 
 export interface ProcessingQueue {
   id: string;
-  type: 'smart_remove' | 'background_removal' | 'segmentation';
+  type: 'smart_remove' | 'background_removal' | 'segmentation' | 'object_detection';
   imageData: ImageData;
   maskPoints: Point[];
   priority: number;
@@ -47,4 +50,32 @@ export interface Point {
 export interface Selection {
   points: Point[];
   isComplete: boolean;
+  detectedObjects?: DetectedObject[];
+  selectedObjectId?: string;
+}
+
+export interface DetectedObject {
+  id: string;
+  label: string;
+  confidence: number;
+  bbox: BoundingBox;
+  mask?: number[][];
+  segmentationMask?: ImageData;
+  color: string;
+}
+
+export interface BoundingBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface HuggingFaceModel {
+  id: string;
+  name: string;
+  type: 'segformer' | 'detr' | 'mask2former' | 'sam';
+  endpoint: string;
+  description: string;
+  bestFor: string[];
 }

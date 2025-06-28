@@ -1,34 +1,73 @@
-import { AIModelConfig, AIServiceResponse, ProcessingProgress, ProcessingResult, Point } from '../types/ai-processing';
+import { AIModelConfig, AIServiceResponse, ProcessingProgress, ProcessingResult, Point, DetectedObject, HuggingFaceModel } from '../types/ai-processing';
 
 class AIProcessingService {
   private static instance: AIProcessingService;
   private processingQueue: Map<string, AbortController> = new Map();
   private memoryUsage: number = 0;
-  private readonly MAX_MEMORY_MB = 512; // 512MB limit
-  private readonly CHUNK_SIZE = 1024 * 1024; // 1MB chunks
+  private readonly MAX_MEMORY_MB = 512;
+  private readonly CHUNK_SIZE = 1024 * 1024;
 
-  // AI Model Configurations
+  // Hugging Face Models Configuration
+  private readonly HUGGINGFACE_MODELS: Record<string, HuggingFaceModel> = {
+    segformer: {
+      id: 'nvidia/segformer-b1-finetuned-cityscapes-1024-1024',
+      name: 'SegFormer B1',
+      type: 'segformer',
+      endpoint: '/api/ai/huggingface/segformer',
+      description: 'Efficient semantic segmentation with Transformer architecture',
+      bestFor: ['general objects', 'urban scenes', 'background removal']
+    },
+    detr_panoptic: {
+      id: 'facebook/detr-resnet-50-panoptic',
+      name: 'DETR Panoptic',
+      type: 'detr',
+      endpoint: '/api/ai/huggingface/detr-panoptic',
+      description: 'Object detection and panoptic segmentation',
+      bestFor: ['multiple objects', 'complex scenes', 'instance segmentation']
+    },
+    mask2former: {
+      id: 'facebook/mask2former-swin-tiny-ade-semantic',
+      name: 'Mask2Former',
+      type: 'mask2former',
+      endpoint: '/api/ai/huggingface/mask2former',
+      description: 'State-of-the-art panoptic segmentation',
+      bestFor: ['high precision', 'detailed masks', 'complex objects']
+    },
+    sam: {
+      id: 'facebook/sam-vit-base',
+      name: 'Segment Anything Model',
+      type: 'sam',
+      endpoint: '/api/ai/huggingface/sam',
+      description: 'Universal segmentation model for any object',
+      bestFor: ['point prompts', 'any object', 'interactive segmentation']
+    }
+  };
+
+  // Legacy AI Models
   private readonly AI_MODELS: Record<string, AIModelConfig> = {
     u2net: {
       name: 'U2Net Background Removal',
       endpoint: '/api/ai/u2net',
       timeout: 30000,
       maxRetries: 3,
-      supportedFormats: ['image/jpeg', 'image/png', 'image/webp']
+      supportedFormats: ['image/jpeg', 'image/png', 'image/webp'],
+      type: 'background_removal'
     },
     deeplab: {
       name: 'DeepLab Semantic Segmentation',
       endpoint: '/api/ai/deeplab',
       timeout: 45000,
       maxRetries: 2,
-      supportedFormats: ['image/jpeg', 'image/png']
+      supportedFormats: ['image/jpeg', 'image/png'],
+      type: 'segmentation'
     },
     rembg: {
       name: 'RemBG Background Removal',
       endpoint: '/api/ai/rembg',
       timeout: 25000,
       maxRetries: 3,
-      supportedFormats: ['image/jpeg', 'image/png', 'image/webp']
+      supportedFormats: ['image/jpeg', 'image/png', 'image/webp'],
+      type: 'background_removal'
     }
   };
 
@@ -40,7 +79,6 @@ class AIProcessingService {
   }
 
   private constructor() {
-    // Monitor memory usage
     this.startMemoryMonitoring();
   }
 
@@ -48,7 +86,7 @@ class AIProcessingService {
     setInterval(() => {
       if ('memory' in performance) {
         const memInfo = (performance as any).memory;
-        this.memoryUsage = memInfo.usedJSHeapSize / (1024 * 1024); // Convert to MB
+        this.memoryUsage = memInfo.usedJSHeapSize / (1024 * 1024);
         
         if (this.memoryUsage > this.MAX_MEMORY_MB) {
           console.warn('High memory usage detected, triggering cleanup');
@@ -59,22 +97,297 @@ class AIProcessingService {
   }
 
   private forceGarbageCollection(): void {
-    // Clear any completed processing operations
     this.processingQueue.forEach((controller, id) => {
       if (controller.signal.aborted) {
         this.processingQueue.delete(id);
       }
     });
 
-    // Force garbage collection if available
     if ('gc' in window) {
       (window as any).gc();
     }
   }
 
+  public async detectObjects(
+    imageData: ImageData,
+    clickPoint?: Point,
+    onProgress?: (progress: ProcessingProgress) => void
+  ): Promise<DetectedObject[]> {
+    const processingId = `object_detection_${Date.now()}`;
+    const abortController = new AbortController();
+    this.processingQueue.set(processingId, abortController);
+
+    try {
+      onProgress?.({
+        stage: 'initialization',
+        progress: 0,
+        message: 'Initializing object detection...'
+      });
+
+      const canvas = document.createElement('canvas');
+      canvas.width = imageData.width;
+      canvas.height = imageData.height;
+      const ctx = canvas.getContext('2d')!;
+      ctx.putImageData(imageData, 0, 0);
+
+      const blob = await new Promise<Blob>((resolve) => {
+        canvas.toBlob((blob) => resolve(blob!), 'image/png');
+      });
+
+      // Try Hugging Face models first
+      const detectedObjects = await this.tryHuggingFaceDetection(
+        blob, 
+        clickPoint, 
+        onProgress, 
+        abortController.signal
+      );
+
+      if (detectedObjects.length > 0) {
+        return detectedObjects;
+      }
+
+      // Fallback to local object detection
+      return await this.fallbackObjectDetection(imageData, clickPoint);
+
+    } catch (error) {
+      console.error('Object detection failed:', error);
+      return [];
+    } finally {
+      this.processingQueue.delete(processingId);
+    }
+  }
+
+  private async tryHuggingFaceDetection(
+    imageBlob: Blob,
+    clickPoint?: Point,
+    onProgress?: (progress: ProcessingProgress) => void,
+    signal?: AbortSignal
+  ): Promise<DetectedObject[]> {
+    // Try different models based on use case
+    const models = clickPoint 
+      ? ['sam', 'mask2former', 'detr_panoptic'] // Point-based detection
+      : ['detr_panoptic', 'mask2former', 'segformer']; // General detection
+
+    for (const modelKey of models) {
+      if (signal?.aborted) break;
+
+      const model = this.HUGGINGFACE_MODELS[modelKey];
+      onProgress?.({
+        stage: 'ai_processing',
+        progress: 30,
+        message: `Detecting objects with ${model.name}...`
+      });
+
+      try {
+        const result = await this.callHuggingFaceService(model, imageBlob, clickPoint, signal);
+        if (result.success && result.detectedObjects) {
+          return result.detectedObjects;
+        }
+      } catch (error) {
+        console.warn(`${model.name} detection failed:`, error);
+        continue;
+      }
+    }
+
+    return [];
+  }
+
+  private async callHuggingFaceService(
+    model: HuggingFaceModel,
+    imageBlob: Blob,
+    clickPoint?: Point,
+    signal?: AbortSignal
+  ): Promise<AIServiceResponse> {
+    const formData = new FormData();
+    formData.append('image', imageBlob);
+    formData.append('model_id', model.id);
+    formData.append('model_type', model.type);
+    
+    if (clickPoint) {
+      formData.append('click_point', JSON.stringify(clickPoint));
+    }
+
+    try {
+      const response = await fetch(model.endpoint, {
+        method: 'POST',
+        body: formData,
+        signal,
+        headers: {
+          'X-API-Key': import.meta.env.VITE_HUGGINGFACE_API_KEY || '',
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      
+      // Parse Hugging Face response format
+      const detectedObjects = this.parseHuggingFaceResponse(result, model.type);
+      
+      return { 
+        success: true, 
+        detectedObjects 
+      };
+
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  private parseHuggingFaceResponse(response: any, modelType: string): DetectedObject[] {
+    const objects: DetectedObject[] = [];
+    const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8'];
+
+    switch (modelType) {
+      case 'detr':
+        if (response.predictions) {
+          response.predictions.forEach((pred: any, index: number) => {
+            objects.push({
+              id: `detr_${index}`,
+              label: pred.label,
+              confidence: pred.score,
+              bbox: {
+                x: pred.box.xmin,
+                y: pred.box.ymin,
+                width: pred.box.xmax - pred.box.xmin,
+                height: pred.box.ymax - pred.box.ymin
+              },
+              color: colors[index % colors.length]
+            });
+          });
+        }
+        break;
+
+      case 'segformer':
+      case 'mask2former':
+        if (response.segments) {
+          response.segments.forEach((segment: any, index: number) => {
+            objects.push({
+              id: `${modelType}_${index}`,
+              label: segment.label,
+              confidence: segment.score || 0.8,
+              bbox: segment.bbox || { x: 0, y: 0, width: 100, height: 100 },
+              mask: segment.mask,
+              color: colors[index % colors.length]
+            });
+          });
+        }
+        break;
+
+      case 'sam':
+        if (response.masks) {
+          response.masks.forEach((mask: any, index: number) => {
+            objects.push({
+              id: `sam_${index}`,
+              label: 'Detected Object',
+              confidence: mask.score || 0.9,
+              bbox: mask.bbox,
+              mask: mask.segmentation,
+              color: colors[index % colors.length]
+            });
+          });
+        }
+        break;
+    }
+
+    return objects;
+  }
+
+  private async fallbackObjectDetection(imageData: ImageData, clickPoint?: Point): Promise<DetectedObject[]> {
+    // Simple edge-based object detection as fallback
+    if (!clickPoint) return [];
+
+    const canvas = document.createElement('canvas');
+    canvas.width = imageData.width;
+    canvas.height = imageData.height;
+    const ctx = canvas.getContext('2d')!;
+    ctx.putImageData(imageData, 0, 0);
+
+    // Simple flood fill to detect connected regions
+    const visited = new Set<string>();
+    const region = this.floodFill(imageData, clickPoint.x, clickPoint.y, visited);
+
+    if (region.length > 100) { // Minimum region size
+      const bbox = this.calculateBoundingBox(region);
+      return [{
+        id: 'fallback_0',
+        label: 'Detected Region',
+        confidence: 0.7,
+        bbox,
+        color: '#FF6B6B'
+      }];
+    }
+
+    return [];
+  }
+
+  private floodFill(imageData: ImageData, startX: number, startY: number, visited: Set<string>): Point[] {
+    const region: Point[] = [];
+    const stack: Point[] = [{ x: startX, y: startY }];
+    const data = imageData.data;
+    const width = imageData.width;
+    const height = imageData.height;
+
+    // Get reference color
+    const refIndex = (startY * width + startX) * 4;
+    const refR = data[refIndex];
+    const refG = data[refIndex + 1];
+    const refB = data[refIndex + 2];
+
+    while (stack.length > 0 && region.length < 10000) { // Limit region size
+      const { x, y } = stack.pop()!;
+      const key = `${x},${y}`;
+
+      if (visited.has(key) || x < 0 || x >= width || y < 0 || y >= height) {
+        continue;
+      }
+
+      const index = (y * width + x) * 4;
+      const r = data[index];
+      const g = data[index + 1];
+      const b = data[index + 2];
+
+      // Color similarity threshold
+      const colorDiff = Math.abs(r - refR) + Math.abs(g - refG) + Math.abs(b - refB);
+      if (colorDiff > 50) continue;
+
+      visited.add(key);
+      region.push({ x, y });
+
+      // Add neighbors
+      stack.push({ x: x + 1, y });
+      stack.push({ x: x - 1, y });
+      stack.push({ x, y: y + 1 });
+      stack.push({ x, y: y - 1 });
+    }
+
+    return region;
+  }
+
+  private calculateBoundingBox(points: Point[]): { x: number; y: number; width: number; height: number } {
+    if (points.length === 0) return { x: 0, y: 0, width: 0, height: 0 };
+
+    const xs = points.map(p => p.x);
+    const ys = points.map(p => p.y);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+
+    return {
+      x: minX,
+      y: minY,
+      width: maxX - minX,
+      height: maxY - minY
+    };
+  }
+
   public async processSmartRemoval(
     imageData: ImageData,
     maskPoints: Point[],
+    selectedObject?: DetectedObject,
     onProgress?: (progress: ProcessingProgress) => void
   ): Promise<ProcessingResult> {
     const processingId = `smart_remove_${Date.now()}`;
@@ -85,15 +398,27 @@ class AIProcessingService {
       onProgress?.({
         stage: 'initialization',
         progress: 0,
-        message: 'Initializing AI processing...'
+        message: 'Initializing AI-powered removal...'
       });
 
-      // Check memory availability
       if (this.memoryUsage > this.MAX_MEMORY_MB * 0.8) {
         throw new Error('Insufficient memory for processing. Please close other tabs and try again.');
       }
 
-      // Try AI-powered removal first
+      // Try Hugging Face models for removal
+      if (selectedObject) {
+        const hfResult = await this.tryHuggingFaceRemoval(
+          imageData, 
+          selectedObject, 
+          onProgress, 
+          abortController.signal
+        );
+        if (hfResult.success) {
+          return hfResult;
+        }
+      }
+
+      // Try legacy AI models
       const aiResult = await this.tryAIRemoval(imageData, maskPoints, onProgress, abortController.signal);
       if (aiResult.success) {
         return aiResult;
@@ -120,6 +445,84 @@ class AIProcessingService {
     }
   }
 
+  private async tryHuggingFaceRemoval(
+    imageData: ImageData,
+    selectedObject: DetectedObject,
+    onProgress?: (progress: ProcessingProgress) => void,
+    signal?: AbortSignal
+  ): Promise<ProcessingResult> {
+    const startTime = Date.now();
+
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = imageData.width;
+      canvas.height = imageData.height;
+      const ctx = canvas.getContext('2d')!;
+      ctx.putImageData(imageData, 0, 0);
+
+      const blob = await new Promise<Blob>((resolve) => {
+        canvas.toBlob((blob) => resolve(blob!), 'image/png');
+      });
+
+      onProgress?.({
+        stage: 'ai_processing',
+        progress: 40,
+        message: 'Processing with Hugging Face inpainting models...'
+      });
+
+      // Use inpainting endpoint
+      const formData = new FormData();
+      formData.append('image', blob);
+      formData.append('object_data', JSON.stringify(selectedObject));
+      formData.append('task', 'inpainting');
+
+      const response = await fetch('/api/ai/huggingface/inpainting', {
+        method: 'POST',
+        body: formData,
+        signal,
+        headers: {
+          'X-API-Key': import.meta.env.VITE_HUGGINGFACE_API_KEY || '',
+        }
+      });
+
+      if (response.ok) {
+        const resultBlob = await response.blob();
+        const processedCanvas = await this.blobToCanvas(resultBlob);
+        
+        return {
+          success: true,
+          canvas: processedCanvas,
+          processingTime: Date.now() - startTime
+        };
+      }
+
+      throw new Error('Hugging Face inpainting failed');
+
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Hugging Face processing failed',
+        processingTime: Date.now() - startTime
+      };
+    }
+  }
+
+  private async blobToCanvas(blob: Blob): Promise<HTMLCanvasElement> {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext('2d')!;
+        ctx.drawImage(img, 0, 0);
+        resolve(canvas);
+      };
+      img.onerror = () => reject(new Error('Failed to load processed image'));
+      img.src = URL.createObjectURL(blob);
+    });
+  }
+
   private async tryAIRemoval(
     imageData: ImageData,
     maskPoints: Point[],
@@ -129,7 +532,6 @@ class AIProcessingService {
     const startTime = Date.now();
 
     try {
-      // Convert ImageData to blob for API transmission
       const canvas = document.createElement('canvas');
       canvas.width = imageData.width;
       canvas.height = imageData.height;
@@ -146,7 +548,6 @@ class AIProcessingService {
         canvas.toBlob((blob) => resolve(blob!), 'image/png');
       });
 
-      // Try different AI models in order of preference
       const models = ['rembg', 'u2net', 'deeplab'];
       
       for (const modelKey of models) {
@@ -177,7 +578,7 @@ class AIProcessingService {
           }
         } catch (modelError) {
           console.warn(`${model.name} failed:`, modelError);
-          continue; // Try next model
+          continue;
         }
       }
 
@@ -229,7 +630,6 @@ class AIProcessingService {
           throw error;
         }
         
-        // Exponential backoff
         await new Promise(resolve => setTimeout(resolve, Math.pow(2, retryCount) * 1000));
       }
     }
@@ -271,7 +671,6 @@ class AIProcessingService {
       const ctx = canvas.getContext('2d')!;
       ctx.putImageData(imageData, 0, 0);
 
-      // Process in chunks to prevent browser freezing
       const chunks = this.createProcessingChunks(imageData, maskPoints);
       
       for (let i = 0; i < chunks.length; i++) {
@@ -284,8 +683,6 @@ class AIProcessingService {
         });
 
         await this.processChunk(ctx, chunks[i]);
-        
-        // Yield control to prevent blocking
         await new Promise(resolve => setTimeout(resolve, 10));
       }
 
@@ -311,8 +708,7 @@ class AIProcessingService {
   }
 
   private createProcessingChunks(imageData: ImageData, maskPoints: Point[]): any[] {
-    // Divide image into manageable chunks for processing
-    const chunkSize = 100; // 100x100 pixel chunks
+    const chunkSize = 100;
     const chunks = [];
     
     for (let y = 0; y < imageData.height; y += chunkSize) {
@@ -331,25 +727,19 @@ class AIProcessingService {
   }
 
   private async processChunk(ctx: CanvasRenderingContext2D, chunk: any): Promise<void> {
-    // Advanced content-aware fill for chunk
     const imageData = ctx.getImageData(chunk.x, chunk.y, chunk.width, chunk.height);
     const data = imageData.data;
     
-    // Apply sophisticated inpainting algorithm
     this.applyContentAwareFill(data, chunk.width, chunk.height, chunk.maskPoints);
     
     ctx.putImageData(imageData, chunk.x, chunk.y);
   }
 
   private applyContentAwareFill(data: Uint8ClampedArray, width: number, height: number, maskPoints: Point[]): void {
-    // Implement advanced inpainting algorithm
-    // This is a simplified version - real implementation would be more complex
-    
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         const idx = (y * width + x) * 4;
         
-        // Sample surrounding pixels intelligently
         const samples = this.sampleSurroundingPixels(data, x, y, width, height);
         if (samples.length > 0) {
           const avg = this.calculateWeightedAverage(samples);
@@ -420,6 +810,13 @@ class AIProcessingService {
 
   public getMemoryUsage(): number {
     return this.memoryUsage;
+  }
+
+  public getAvailableModels(): { huggingface: HuggingFaceModel[]; legacy: AIModelConfig[] } {
+    return {
+      huggingface: Object.values(this.HUGGINGFACE_MODELS),
+      legacy: Object.values(this.AI_MODELS)
+    };
   }
 
   public cleanup(): void {
