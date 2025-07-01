@@ -1,3 +1,12 @@
+Otro experimento Vibe Coded, este de hecho fue el primero.
+
+La idea es quitar o filtrar determinado elemento de una imagen o video, ya sea una persona u objeto. Se edita con la UI y se baja el resultado.
+Sólo lo probé con imágenes. Básicamente hacés un recorte con unos nodos y aplica unos filtros o borra. Estuve agregando cosas tipo AI smart selection o que use modelos de HuggingFace para procesar el contenido pero necesito una API key o pagar porque tiene poco límite, estoy buscando otro provider o ver qué se hace. Ni lo hostié aún.
+
+------
+# De ahora en mas es IA
+---------
+
 # Black Mirror Media Editor
 
 Advanced AI-powered media manipulation tool with intelligent background removal and image processing capabilities powered by Hugging Face models.
